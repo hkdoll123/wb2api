@@ -1,0 +1,125 @@
+name: Manual release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to embed for an untagged build'
+        required: false
+        default: dev
+        type: string
+      tag:
+        description: 'Existing version tag (v*). Leave blank to build the selected ref.'
+        required: false
+        type: string
+      publish:
+        description: 'Publish the checksums and binaries to the selected existing tag'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.pin.outputs.sha }}
+    steps:
+      - name: Validate selection
+        env:
+          TAG: ${{ inputs.tag }}
+          PUBLISH: ${{ inputs.publish }}
+        run: |
+          if [[ -z "$TAG" && "$PUBLISH" == true ]]; then
+            echo "::error::An existing version tag is required for publication."
+            exit 1
+          fi
+          if [[ -n "$TAG" ]]; then
+            [[ "$TAG" == v* ]] && git check-ref-format "refs/tags/$TAG" || exit 1
+          fi
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.sha }}
+          persist-credentials: false
+      - id: pin
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+  binary:
+    needs: source
+    name: linux-${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.source.outputs.sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+          cache: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build web console
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build binary
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: "0"
+          VERSION: ${{ inputs.tag || inputs.version || 'dev' }}
+        run: |
+          mkdir -p dist
+          go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
+            -o "dist/wb2api-linux-${GOARCH}" ./cmd/hub
+          (cd dist && sha256sum "wb2api-linux-${GOARCH}" > "wb2api-linux-${GOARCH}.sha256")
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wb2api-linux-${{ matrix.arch }}
+          path: dist/wb2api-linux-${{ matrix.arch }}*
+
+  release:
+    name: publish release
+    if: inputs.publish
+    needs: [source, binary]
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Verify the tag still points at the built source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ format('refs/tags/{0}', inputs.tag) }}
+          path: verify-release-source
+          persist-credentials: false
+      - name: Compare the selected revision
+        env:
+          BUILT_SHA: ${{ needs.source.outputs.sha }}
+        run: test "$(git -C verify-release-source rev-parse HEAD)" = "$BUILT_SHA"
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
